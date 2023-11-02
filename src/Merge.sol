@@ -22,6 +22,11 @@ contract Merge is IERC721, ERC165, IERC721Metadata, Ownable {
     error Merge__CallerIsNotOwnerNorApproved();
     error Merge__CannotApproveToMsgSender();
     error Merge__MintingFinalized();
+    error Merge__MassTotalOverflow();
+    error Merge__RoyaltyOverflow();
+    error Merge__AddressCannotBeOmnibus();
+    error Merge__OmnibusCannotBeRemoved();
+    error Merge__AddressWithMoreThanOneTokenCannotBeRemoved();
 
     bool private s_frozen;
     bool private s_mintingFinalized;
@@ -30,7 +35,9 @@ contract Merge is IERC721, ERC165, IERC721Metadata, Ownable {
     uint256 private s_totalSupply;
     uint256 private s_massTotal;
     uint256 private s_nextMintId;
+    uint256 private s_percentageRoyalty;
     address private s_omnibus;
+    address private s_receiver;
 
     string private constant NAME = "merge.";
     string private constant SYMBOL = "m";
@@ -39,6 +46,7 @@ contract Merge is IERC721, ERC165, IERC721Metadata, Ownable {
     uint256 private constant MAX_MASS_EXCL = CLASS_MULTIPLIER - 1;
     uint256 private constant MIN_CLASS_INCL = 1;
     uint256 private constant MAX_CLASS_INCL = 4;
+    uint256 private constant PERCENTAGE_TOTAL = 10000;
     address private constant DEAD = 0x000000000000000000000000000000000000dEaD;
 
     mapping(address => bool) private s_whitelistAddress;
@@ -70,9 +78,13 @@ contract Merge is IERC721, ERC165, IERC721Metadata, Ownable {
         _;
     }
 
-    constructor(address omnibus) Ownable(msg.sender) {
+    constructor(address omnibus, address receiver) Ownable(msg.sender) {
         s_nextMintId = 1;
         s_omnibus = omnibus;
+        s_percentageRoyalty = 1000;
+        s_receiver = receiver;
+
+        s_whitelistAddress[omnibus] = true;
         s_blacklistAddress[address(this)] = true;
     }
 
@@ -123,11 +135,40 @@ contract Merge is IERC721, ERC165, IERC721Metadata, Ownable {
                 newlyMintedCount++;
                 s_value[index] = values[valueIx];
                 s_owner[index] = omnibus;
+
+                ( /* uint256 class */ , uint256 mass) = decodeClassAndMass(values[valueIx]);
+
+                if (alphaMass < mass) {
+                    alphaMass = mass;
+                    alphaId = index;
+                }
+
+                massAdded += mass;
+                emit Transfer(address(0), omnibus, index);
             }
+            valueIx++;
+            index++;
+        }
+
+        s_nextMintId = index;
+        s_totalSupply += newlyMintedCount;
+        s_balance[omnibus] += newlyMintedCount;
+
+        uint256 prevMassTotal = s_massTotal;
+        uint256 newMassTotal = prevMassTotal + massAdded;
+        if (newMassTotal >= MAX_MASS_EXCL) {
+            revert Merge__MassTotalOverflow();
+        }
+        s_massTotal = newMassTotal;
+
+        if (alphaId != s_alphaId) {
+            s_alphaId = alphaId;
+            s_alphaMass = alphaMass;
+            emit AlphaMassUpdated(alphaId, alphaMass);
         }
     }
 
-    function burn(uint256 tokenId) public notFrozen {
+    function burn(uint256 tokenId) external notFrozen {
         (address owner, bool isApprovedOrOwner) = _isApprovedOrOwner(msg.sender, tokenId);
         if (!isApprovedOrOwner) {
             revert Merge__CallerIsNotOwnerNorApproved();
@@ -138,7 +179,7 @@ contract Merge is IERC721, ERC165, IERC721Metadata, Ownable {
         emit Transfer(owner, address(0), tokenId);
     }
 
-    function approve(address to, uint256 tokenId) public {
+    function approve(address to, uint256 tokenId) external {
         address owner = ownerOf(tokenId);
         if (to == owner) {
             revert Merge__CannotApproveToCurrentOwner();
@@ -149,12 +190,67 @@ contract Merge is IERC721, ERC165, IERC721Metadata, Ownable {
         _approve(owner, to, tokenId);
     }
 
-    function setApprovalForAll(address operator, bool approved) public {
+    function setApprovalForAll(address operator, bool approved) external {
         if (operator == msg.sender) {
             revert Merge__CannotApproveToMsgSender();
         }
         s_operatorApprovals[msg.sender][operator] = approved;
         emit ApprovalForAll(msg.sender, operator, approved);
+    }
+
+    function safeTransferFrom(address from, address to, uint256 tokenId) public virtual override {
+        safeTransferFrom(from, to, tokenId, "");
+    }
+
+    function safeTransferFrom(address from, address to, uint256 tokenId, bytes memory _data) public virtual override {
+        transferFrom(from, to, tokenId);
+        require(_checkOnERC721Received(from, to, tokenId, _data), "ERC721: transfer to non ERC721Receiver implementer");
+    }
+
+    function transferFrom(address from, address to, uint256 tokenId) public virtual override {
+        (address owner, bool isApprovedOrOwner) = _isApprovedOrOwner(_msgSender(), tokenId);
+        require(isApprovedOrOwner, "ERC721: transfer caller is not owner nor approved");
+        _transfer(owner, from, to, tokenId);
+    }
+
+    function royaltyInfo(uint256 tokenId, uint256 salePrice) external view returns (address, uint256) {
+        uint256 royaltyAmount = (salePrice * s_percentageRoyalty) / PERCENTAGE_TOTAL;
+        return (s_receiver, royaltyAmount);
+    }
+
+    function setRoyaltyBips(uint256 percentageRoyalty) external onlyOwner {
+        if (percentageRoyalty > PERCENTAGE_TOTAL) {
+            revert Merge__RoyaltyOverflow();
+        }
+        s_percentageRoyalty = percentageRoyalty;
+    }
+
+    function setRoyaltyReceiver(address receiver) external onlyOwner {
+        s_receiver = receiver;
+    }
+
+    function setBlacklistAddress(address addr, bool status) external onlyOwner {
+        if (addr == s_omnibus) {
+            revert Merge__AddressCannotBeOmnibus();
+        }
+
+        s_blacklistAddress[addr] = status;
+    }
+
+    function whitelistUpdate(address addr, bool status) external onlyOwner {
+        if (addr == s_omnibus) {
+            if (status == false) {
+                revert Merge__OmnibusCannotBeRemoved();
+            }
+        }
+
+        if (status == false) {
+            if (s_balance[addr] > 1) {
+                revert Merge__AddressWithMoreThanOneTokenCannotBeRemoved();
+            }
+        }
+
+        s_whitelistAddress[addr] = status;
     }
 
     function finalize() external onlyOwner {
@@ -377,7 +473,7 @@ contract Merge is IERC721, ERC165, IERC721Metadata, Ownable {
     function decodeClassAndMass(uint256 value) public pure returns (uint256, uint256) {
         uint256 class = decodeClass(value);
         uint256 mass = value % CLASS_MULTIPLIER;
-        ensureValidMass(mass);
+        return (class, mass);
     }
 
     function decodeClass(uint256 value) public pure returns (uint256 class) {
@@ -421,13 +517,25 @@ contract Merge is IERC721, ERC165, IERC721Metadata, Ownable {
         }
     }
 
+    function balanceOf(address owner) external view returns (uint256) {
+        return s_balance[owner];
+    }
+
     function isWhitelisted(address addr) public view returns (bool) {
         return s_whitelistAddress[addr];
     }
 
+    function isBlacklisted(address addr) public view returns (bool) {
+        return s_blacklistAddress[addr];
+    }
+
     function supportsInterface(bytes4 interfaceId) public view virtual override(ERC165, IERC165) returns (bool) {
-        return interfaceId == type(IERC721).interfaceId || interfaceId == type(IERC721Metadata).interfaceId
-            || super.supportsInterface(interfaceId);
+        bytes4 _ERC165_ = 0x01ffc9a7;
+        bytes4 _ERC721_ = 0x80ac58cd;
+        bytes4 _ERC2981_ = 0x2a55205a;
+        bytes4 _ERC721Metadata_ = 0x5b5e139f;
+        return interfaceId == _ERC165_ || interfaceId == _ERC721_ || interfaceId == _ERC2981_
+            || interfaceId == _ERC721Metadata_;
     }
 
     function _isApprovedOrOwner(address spender, uint256 tokenId)
